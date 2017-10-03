@@ -120,6 +120,18 @@ public class Share implements AutoCloseable {
     }
 
     SMB2CreateResponse createFile(String path, SMB2ImpersonationLevel impersonationLevel, Set<AccessMask> accessMask, Set<FileAttributes> fileAttributes, Set<SMB2ShareAccess> shareAccess, SMB2CreateDisposition createDisposition, Set<SMB2CreateOptions> createOptions) {
+        try {
+            return doCreateFile(path, impersonationLevel, accessMask, fileAttributes, shareAccess, createDisposition, createOptions);
+        } catch (SymbolicLinkException e) {
+            // if the link is absolute and point on another disk we are not able to follow it on the current share
+            if (e.isAbsolute() && !e.getAdminShareName().equalsIgnoreCase(smbPath.getShareName())) {
+                throw e;
+            }
+            return doCreateFile(e.getTargetPath(), impersonationLevel, accessMask, fileAttributes, shareAccess, createDisposition, createOptions);
+        }
+    }
+    
+    SMB2CreateResponse doCreateFile(String path, SMB2ImpersonationLevel impersonationLevel, Set<AccessMask> accessMask, Set<FileAttributes> fileAttributes, Set<SMB2ShareAccess> shareAccess, SMB2CreateDisposition createDisposition, Set<SMB2CreateOptions> createOptions) {
         SMB2CreateRequest cr = new SMB2CreateRequest(
             dialect,
             sessionId, treeId,
@@ -336,7 +348,11 @@ public class Share implements AutoCloseable {
 
         NtStatus status = resp.getHeader().getStatus();
         if (!successResponses.contains(status)) {
-            throw new SMBApiException(resp.getHeader(), name + " failed for " + target);
+            if (status == NtStatus.STATUS_STOPPED_ON_SYMLINK) {
+                throw new SymbolicLinkException(name, target, resp);
+            } else {
+                throw new SMBApiException(resp.getHeader(), name + " failed for " + target);
+            }
         }
         return resp;
     }

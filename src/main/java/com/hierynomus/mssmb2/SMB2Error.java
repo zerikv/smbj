@@ -20,8 +20,11 @@ import com.hierynomus.protocol.commons.buffer.Buffer;
 import com.hierynomus.smb.SMBBuffer;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * [MS-SMB2] 2.2.2 SMB2 ERROR Response
@@ -144,6 +147,87 @@ public class SMB2Error {
         }
     }
 
+    
+    /**
+     * Apply the rules describe in <a href="https://msdn.microsoft.com/en-us/library/dd358040.aspx">
+     * 2.2.2.2.1.1 Handling the Symbolic Link Error Response</a>
+     * <p>
+     * If the target of the symbolic link is absolute then the path returned in SubstituteName 
+     * is formated as an absolute local NT Path, for example: "\??\D:\DonHall\MiscDocuments\PDocsD".<br>
+     * In order to open the target path on the Share, we have to remove the NT Path prefix: \??\D:\
+     * 
+     * @see: https://googleprojectzero.blogspot.fr/2016/02/the-definitive-guide-on-win32-to-nt.html
+     */    
+    public static class SymbolicLinkResolver {
+        private final static String WINDOWS_FILE_SEPARATOR = "\\";
+        private final static String LINUX_FILE_SEPARATOR = "/";
+        
+        private final static String BEGIN = "^";
+        private final static String SLASH = "\\\\";
+        private final static String QUESTION_MARK = "\\?";
+        private final static String COLON = "\\:";
+        private final static String CAPTURE_DRIVE_LETTER = "([A-Z])";
+        
+        // prefix for native NT Path (for example: "\??\C:\"), must be removed to obtain a path usable with a share
+        private final static String NT_PATH_PREFIX_REGEX = BEGIN + SLASH + QUESTION_MARK + QUESTION_MARK + SLASH + CAPTURE_DRIVE_LETTER + COLON + SLASH;
+        private final static Pattern NT_PATH_PREFIX_PATTERN = Pattern.compile(NT_PATH_PREFIX_REGEX);
+        
+        private final SymbolicLinkError error;
+        private final String targetPath;
+        private final String driverLetter;
+        
+        public SymbolicLinkResolver(SymbolicLinkError error, String symlinkPath) {
+            this.error = error;
+
+            // length count bytes but encoding in SMB2 message is Unicode UTF-16
+            int unparsedPathCharLength = error.getUnparsedPathLength() / 2;
+            
+            // The size, in bytes, of the unparsed portion is specified in the UnparsedPathLength field. 
+            // The byte count MUST be used from the end of the path-name string and walked backward to find 
+            // the starting location of the unparsed bytes.
+            int unparsedPathPos = symlinkPath.length() - unparsedPathCharLength;
+            String unparsedPath = symlinkPath.substring(unparsedPathPos);
+            
+            String substituteName = error.getSubstituteName();
+            String driverLetter = "";
+            if (error.isAbsolute()) {
+                // In the case of an absolute path, the format returned in the substitute name is native Path NT (e.g beginning by "\??\C:\")
+                Matcher ntPathMatcher = NT_PATH_PREFIX_PATTERN.matcher(substituteName);
+                if (ntPathMatcher.find()) {
+                    driverLetter = ntPathMatcher.group(1);
+                    substituteName = substituteName.substring(ntPathMatcher.end());
+                }                
+                // If the SYMLINK_FLAG_RELATIVE flag is not set in the Flags field of the symbolic link error response, 
+                // the unparsed portion of the file name MUST be appended to the substitute name to create the new target path name.
+                // targetPath = substitute name concatenated with the unparsed portion of the file                
+                targetPath = substituteName + WINDOWS_FILE_SEPARATOR + unparsedPath;
+            } else {
+                // If the SYMLINK_FLAG_RELATIVE flag is set in the Flags field of the symbolic link error response, 
+                // the symbolic link name MUST be identified by backing up one path name element from the unparsed 
+                // portion of the path name. The symbolic link MUST be replaced with the substitute name to create the new target path name.
+                int symLinkNamePos = symlinkPath.lastIndexOf(WINDOWS_FILE_SEPARATOR, unparsedPathPos -1);
+                String beginPath = symlinkPath.substring(0, symLinkNamePos);
+                String workTargetPath = beginPath + WINDOWS_FILE_SEPARATOR + substituteName + WINDOWS_FILE_SEPARATOR + unparsedPath;
+                // Because "." and ".." are not permitted as components of a path name to be sent over the wire, 
+                // before reissuing the SMB2 CREATE request the client MUST first eliminate the ".." by normalizing the new target path name.
+                targetPath = Paths.get(workTargetPath).normalize().toFile().getPath().replaceAll(LINUX_FILE_SEPARATOR, WINDOWS_FILE_SEPARATOR);
+            }
+            this.driverLetter = driverLetter;
+        }
+
+        public boolean isAbsolute() {
+            return error.isAbsolute();
+        }
+        
+        public String getTargetPath() {
+            return targetPath;
+        }
+        
+        public String getDriverLetter() {
+            return driverLetter;
+        }        
+    }
+    
     public static class BufferTooSmallError implements SMB2ErrorData {
         private long requiredBufferLength;
 
